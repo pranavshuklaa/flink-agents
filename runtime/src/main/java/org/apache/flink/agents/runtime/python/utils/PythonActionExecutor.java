@@ -21,20 +21,28 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.agents.api.Event;
 import org.apache.flink.agents.api.agents.AgentExecutionOptions;
+import org.apache.flink.agents.api.resource.Resource;
+import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.plan.AgentPlan;
 import org.apache.flink.agents.plan.PythonFunction;
+import org.apache.flink.agents.runtime.operator.ActionTask;
 import org.apache.flink.agents.runtime.python.context.PythonRunnerContextImpl;
+import org.apache.flink.agents.runtime.python.resource.PythonRuntimeResource;
 import org.apache.flink.types.Row;
+import org.apache.flink.util.ExceptionUtils;
 import pemja.core.PythonInterpreter;
 import pemja.core.object.PyObject;
 
 import java.io.IOException;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.apache.flink.util.Preconditions.checkState;
 
 /** Execute the corresponding Python action in the agent. */
-public class PythonActionExecutor {
+public class PythonActionExecutor implements AutoCloseable {
 
     private static final String PYTHON_IMPORTS =
             "from flink_agents.plan import function\n"
@@ -47,6 +55,28 @@ public class PythonActionExecutor {
 
     private static final String CLOSE_FLINK_RUNNER_CONTEXT =
             "flink_runner_context.close_flink_runner_context";
+
+    // =========== PYTHON RESOURCE MATERIALIZATION ===========
+    private static final String EAGER_MATERIALIZE = "flink_runner_context.eager_materialize";
+
+    // =========== TASK LIFECYCLE FORWARDING ===========
+    private static final String ADD_TASK_LIFECYCLE_LISTENER =
+            "flink_runner_context.add_task_lifecycle_listener";
+    private static final String NOTIFY_RECORD_START = "flink_runner_context.notify_record_start";
+    private static final String NOTIFY_ACTION_PREPARED =
+            "flink_runner_context.notify_action_prepared";
+    private static final String NOTIFY_ACTION_STARTED =
+            "flink_runner_context.notify_action_started";
+    private static final String NOTIFY_ACTION_TRANSFERRED =
+            "flink_runner_context.notify_action_transferred";
+    private static final String NOTIFY_ACTION_FINISHING =
+            "flink_runner_context.notify_action_finishing";
+    private static final String NOTIFY_ACTION_FINISHED =
+            "flink_runner_context.notify_action_finished";
+    private static final String NOTIFY_ACTION_REUSED = "flink_runner_context.notify_action_reused";
+    private static final String NOTIFY_ACTION_FAILED = "flink_runner_context.notify_action_failed";
+    private static final String NOTIFY_RECORD_FINISHED =
+            "flink_runner_context.notify_record_finished";
 
     // ========== ASYNC THREAD POOL ===========
     private static final String CREATE_ASYNC_THREAD_POOL =
@@ -94,6 +124,87 @@ public class PythonActionExecutor {
 
     public PyObject getPythonRunnerContext() {
         return pythonRunnerContext;
+    }
+
+    /**
+     * Materializes every resource of the given type that the Python runtime owns and returns one
+     * handle per resource, keyed by resource name.
+     *
+     * <p>See {@link PythonRuntimeResource} for what the returned handle may and may not do.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Resource> eagerMaterialize(ResourceType type) {
+        Object pythonResources =
+                interpreter.invoke(EAGER_MATERIALIZE, pythonRunnerContext, type.getValue());
+        if (pythonResources == null) {
+            return Collections.emptyMap();
+        }
+        Map<String, Resource> handles = new HashMap<>();
+        ((Map<String, PyObject>) pythonResources)
+                .forEach(
+                        (name, pythonResource) ->
+                                handles.put(name, new PythonRuntimeResource(type, pythonResource)));
+        return handles;
+    }
+
+    /**
+     * Registers a Python object in the Python runtime's task lifecycle registry. The Python side
+     * fans the operator's callbacks out to that registry when {@link
+     * org.apache.flink.agents.runtime.lifecycle.PythonTaskLifecycleListener} forwards them.
+     *
+     * @return whether the object observes the lifecycle, so the caller can tell whether the Python
+     *     runtime has anything to be notified about.
+     */
+    public boolean addTaskLifecycleListener(PyObject pythonListener) {
+        Object registered =
+                interpreter.invoke(
+                        ADD_TASK_LIFECYCLE_LISTENER, pythonRunnerContext, pythonListener);
+        return Boolean.TRUE.equals(registered);
+    }
+
+    /** Forwards {@code onRecordStart} to the Python runtime lifecycle listeners. */
+    public void notifyRecordStart(Object key) {
+        interpreter.invoke(NOTIFY_RECORD_START, pythonRunnerContext, key);
+    }
+
+    /** Forwards {@code onActionPrepared} to the Python runtime lifecycle listeners. */
+    public void notifyActionPrepared(ActionTask task) {
+        interpreter.invoke(NOTIFY_ACTION_PREPARED, pythonRunnerContext, task);
+    }
+
+    /** Forwards {@code onActionStarted} to the Python runtime lifecycle listeners. */
+    public void notifyActionStarted(ActionTask task) {
+        interpreter.invoke(NOTIFY_ACTION_STARTED, pythonRunnerContext, task);
+    }
+
+    /** Forwards {@code onActionTransferred} to the Python runtime lifecycle listeners. */
+    public void notifyActionTransferred(ActionTask fromTask, ActionTask toTask) {
+        interpreter.invoke(NOTIFY_ACTION_TRANSFERRED, pythonRunnerContext, fromTask, toTask);
+    }
+
+    /** Forwards {@code onActionFinishing} to the Python runtime lifecycle listeners. */
+    public void notifyActionFinishing(ActionTask task) {
+        interpreter.invoke(NOTIFY_ACTION_FINISHING, pythonRunnerContext, task);
+    }
+
+    /** Forwards {@code onActionFinished} to the Python runtime lifecycle listeners. */
+    public void notifyActionFinished(ActionTask task) {
+        interpreter.invoke(NOTIFY_ACTION_FINISHED, pythonRunnerContext, task);
+    }
+
+    /** Forwards {@code onActionReused} to the Python runtime lifecycle listeners. */
+    public void notifyActionReused(ActionTask task) {
+        interpreter.invoke(NOTIFY_ACTION_REUSED, pythonRunnerContext, task);
+    }
+
+    /** Forwards {@code onActionFailed} to the Python runtime lifecycle listeners. */
+    public void notifyActionFailed(ActionTask task, Throwable error) {
+        interpreter.invoke(NOTIFY_ACTION_FAILED, pythonRunnerContext, task, error);
+    }
+
+    /** Forwards {@code onRecordFinished} to the Python runtime lifecycle listeners. */
+    public void notifyRecordFinished(Object key) {
+        interpreter.invoke(NOTIFY_RECORD_FINISHED, pythonRunnerContext, key);
     }
 
     public void open() throws Exception {
@@ -201,18 +312,45 @@ public class PythonActionExecutor {
         return (boolean) ((Object[]) invokeResult)[0];
     }
 
+    @Override
     public void close() throws Exception {
-        if (interpreter != null) {
-            if (pythonAsyncThreadPool != null) {
-                interpreter.invoke(CLOSE_ASYNC_THREAD_POOL, pythonAsyncThreadPool);
-            }
+        // The two Python-side cleanups are independent, so attempt both even when the first
+        // fails. Skipping the runner-context cleanup leaves that context's long-term memory and
+        // resource cache unreleased, and PythonBridgeManager closes the interpreter right behind
+        // us, so there is no later chance to run it. The first failure is rethrown with the later
+        // one suppressed, matching the ladders in the managers above.
+        if (interpreter == null) {
+            return;
+        }
 
-            if (pythonRunnerContext != null) {
-                try {
-                    interpreter.invoke(CLOSE_FLINK_RUNNER_CONTEXT, pythonRunnerContext);
-                } finally {
-                    pythonRunnerContext = null;
-                }
+        // Clear the fields before releasing: PyObject.close() performs an unguarded native decRef,
+        // so a repeated close() must not reach the same handle twice.
+        PyObject asyncThreadPool = pythonAsyncThreadPool;
+        PyObject runnerContext = pythonRunnerContext;
+        pythonAsyncThreadPool = null;
+        pythonRunnerContext = null;
+
+        Throwable firstFailure = null;
+        try {
+            closePythonObject(CLOSE_ASYNC_THREAD_POOL, asyncThreadPool);
+        } catch (Throwable t) {
+            firstFailure = ExceptionUtils.firstOrSuppressed(t, firstFailure);
+        }
+        try {
+            closePythonObject(CLOSE_FLINK_RUNNER_CONTEXT, runnerContext);
+        } catch (Throwable t) {
+            firstFailure = ExceptionUtils.firstOrSuppressed(t, firstFailure);
+        }
+
+        if (firstFailure != null) {
+            ExceptionUtils.rethrowException(firstFailure);
+        }
+    }
+
+    private void closePythonObject(String closeFunction, PyObject pythonObject) throws Exception {
+        if (pythonObject != null) {
+            try (pythonObject) {
+                interpreter.invoke(closeFunction, pythonObject);
             }
         }
     }

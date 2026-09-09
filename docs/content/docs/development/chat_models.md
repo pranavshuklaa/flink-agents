@@ -287,13 +287,12 @@ Anthropic provides cloud-based chat models featuring the Claude family, known fo
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `connection` | str | Required | Reference to connection method name |
-| `model` | str | `"claude-sonnet-4-20250514"` | Name of the chat model to use |
+| `model` | str | `"claude-sonnet-4-6"` | Name of the chat model to use |
 | `prompt` | Prompt \| str | None | Prompt template or reference to prompt resource |
 | `tools` | List[str] | None | List of tool names available to the model |
 | `max_tokens` | int | `1024` | Maximum number of tokens to generate |
-| `temperature` | float | `0.1` | Sampling temperature (0.0 to 1.0) |
+| `temperature` | float | `0.1` | Sampling temperature (0.0 to 1.0) (not sent on Claude 4.7 and later, which reject a non-default sampling parameter) |
 | `json_prefill` | bool | `False` | Prefill assistant response with "{" to enforce JSON output (applies only on models that accept assistant-message prefilling; disabled when tools are used, or when the request carries an `output_config`) |
-| `additional_kwargs` | dict | `{}` | Additional Anthropic API parameters |
 
 {{< /tab >}}
 
@@ -302,14 +301,14 @@ Anthropic provides cloud-based chat models featuring the Claude family, known fo
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `connection` | String | Required | Reference to connection method name |
-| `model` | String | `"claude-sonnet-4-20250514"` | Name of the chat model to use |
+| `model` | String | `"claude-sonnet-4-6"` | Name of the chat model to use |
 | `prompt` | Prompt \| String | None | Prompt template or reference to prompt resource |
 | `tools` | List<String> | None | List of tool names available to the model |
 | `max_tokens` | long | `1024` | Maximum number of tokens to generate |
-| `temperature` | double | `0.1` | Sampling temperature (0.0 to 1.0) |
+| `temperature` | double | `0.1` | Sampling temperature (0.0 to 1.0) (not sent on Claude 4.7 and later, which reject a non-default sampling parameter) |
 | `json_prefill` | boolean | `false` | Prefill assistant response with "{" to enforce JSON output (applies only on models that accept assistant-message prefilling; disabled when tools are used, or when the request carries an `output_config`) |
 | `strict_tools` | boolean | `false` | Enable strict mode for tool calling schemas |
-| `additional_kwargs` | Map<String, Object> | `{}` | Additional Anthropic API parameters (top_k, top_p, stop_sequences); an `output_config` supplied here takes precedence over one derived from an output schema |
+| `additional_kwargs` | Map<String, Object> | `{}` | Additional Anthropic API parameters (`temperature`, `top_k`, `top_p`, `stop_sequences`); none of the three sampling parameters is sent on Claude 4.7 and later. A `temperature` supplied here takes precedence over the top-level one, and an `output_config` supplied here takes precedence over one derived from an output schema |
 
 {{< /tab >}}
 
@@ -339,7 +338,7 @@ class MyAgent(Agent):
         return ResourceDescriptor(
             clazz=ResourceName.ChatModel.ANTHROPIC_SETUP,
             connection="anthropic_connection",
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=2048,
             temperature=0.7
         )
@@ -364,7 +363,7 @@ public class MyAgent extends Agent {
     public static ResourceDescriptor anthropicChatModel() {
         return ResourceDescriptor.Builder.newBuilder(ResourceName.ChatModel.ANTHROPIC_SETUP)
                 .addInitialArgument("connection", "anthropicConnection")
-                .addInitialArgument("model", "claude-sonnet-4-20250514")
+                .addInitialArgument("model", "claude-sonnet-4-6")
                 .addInitialArgument("temperature", 0.7d)
                 .addInitialArgument("max_tokens", 2048)
                 .build();
@@ -382,10 +381,9 @@ public class MyAgent extends Agent {
 Visit the [Anthropic Models documentation](https://docs.anthropic.com/en/docs/about-claude/models) for the complete and up-to-date list of available chat models.
 
 Some popular options include:
-- **Claude Sonnet 4.5** (claude-sonnet-4-5-20250929)
-- **Claude Sonnet 4** (claude-sonnet-4-20250514)
-- **Claude Sonnet 3.7** (claude-3-7-sonnet-20250219)
-- **Claude Opus 4.1** (claude-opus-4-1-20250805)
+- **Claude Opus 4.6** (claude-opus-4-6)
+- **Claude Sonnet 4.6** (claude-sonnet-4-6)
+- **Claude Haiku 4.5** (claude-haiku-4-5)
 
 {{< hint warning >}}
 Model availability and specifications may change. Always check the official Anthropic documentation for the latest information before implementing in production.

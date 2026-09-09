@@ -174,6 +174,9 @@ final class ChatModelInvoker {
                 ExecutionReporters.succeeded(
                         ctx, ExecutionReporter.EntityTypes.LLM, model, llmMetadata);
                 ChatModelAction.recordChatTokenMetrics(chatModel, response, requestMetricGroup);
+                // A truncated response consumed its full token budget, so the token metrics
+                // above are recorded before this rejects and abandons the response.
+                ChatModelAction.rejectIncompleteResponse(response);
                 // only generate structured output for final response.
                 if (outputSchema != null && response.getToolCalls().isEmpty()) {
                     response =
@@ -182,6 +185,12 @@ final class ChatModelInvoker {
                 }
                 return new ChatAttemptResult(
                         model, chatModel, response, actualRetryCount, totalWaitTimeSec);
+            } catch (InterruptedException e) {
+                // A cancellation signal, not a model failure: restore the interrupt status and
+                // propagate immediately so task shutdown isn't delayed by retry backoff or an
+                // extra model call, regardless of the configured error-handling strategy.
+                Thread.currentThread().interrupt();
+                throw e;
             } catch (Exception e) {
                 if (strategy == Agent.ErrorHandlingStrategy.RETRY && attempt < numRetries) {
                     actualRetryCount = attempt + 1;
@@ -194,7 +203,12 @@ final class ChatModelInvoker {
                             numRetries,
                             currentWaitSec);
                     if (currentWaitSec > 0) {
-                        Thread.sleep(currentWaitSec * 1000L);
+                        try {
+                            Thread.sleep(currentWaitSec * 1000L);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            throw ie;
+                        }
                         totalWaitTimeSec += currentWaitSec;
                     }
                     continue;

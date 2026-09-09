@@ -34,18 +34,38 @@ import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.api.resource.SerializableResource;
 import org.apache.flink.agents.api.resource.python.PythonResourceAdapter;
 import org.apache.flink.agents.api.resource.python.PythonResourceWrapper;
+import org.apache.flink.agents.api.skills.SkillSourceSpec;
+import org.apache.flink.agents.api.skills.Skills;
+import org.apache.flink.agents.api.subagent.SubagentFuture;
 import org.apache.flink.agents.api.vectorstores.Document;
 import org.apache.flink.agents.api.vectorstores.VectorStoreQuery;
 import org.apache.flink.agents.api.vectorstores.VectorStoreQueryResult;
 import org.apache.flink.agents.plan.AgentPlan;
+import org.apache.flink.agents.plan.resourceprovider.JavaSerializableResourceProvider;
+import org.apache.flink.agents.plan.resourceprovider.ResourceProvider;
+import org.apache.flink.agents.runtime.python.utils.PythonActionExecutor;
+import org.apache.flink.agents.runtime.resource.ResourceContextImpl;
+import org.apache.flink.agents.runtime.skill.AgentSkill;
+import org.apache.flink.agents.runtime.skill.SkillManager;
+import org.apache.flink.agents.runtime.skill.SkillRepository;
+import org.apache.flink.agents.runtime.skill.SkillSourceRegistry;
+import org.apache.flink.agents.runtime.subagent.BaseSubagentSetup;
 import org.junit.jupiter.api.Test;
 import pemja.core.object.PyObject;
 
+import java.lang.reflect.Field;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /** Tests for {@link ResourceCache}. */
 public class ResourceCacheTest {
@@ -207,6 +227,57 @@ public class ResourceCacheTest {
         }
     }
 
+    /** Stands in for a handle to a resource that the Python runtime owns. */
+    public static class TestPythonHandle extends Resource {
+        @Override
+        public ResourceType getResourceType() {
+            return ResourceType.CHAT_MODEL;
+        }
+    }
+
+    @Test
+    public void testEagerMaterializeResolvesEveryJavaOwnedResourceOfTheType() throws Exception {
+        TestAgentWithResources agent = new TestAgentWithResources();
+        AgentPlan agentPlan = new AgentPlan(agent);
+        ResourceCache cache = new ResourceCache(agentPlan.getResourceProviders());
+
+        List<Resource> materialized = cache.eagerMaterialize(ResourceType.TOOL);
+
+        assertThat(materialized).hasSize(2).allMatch(resource -> resource instanceof TestTool);
+        assertThat(materialized).contains(cache.getResource("myTool", ResourceType.TOOL));
+        assertThat(materialized).contains(cache.getResource("anotherTool", ResourceType.TOOL));
+    }
+
+    @Test
+    public void testEagerMaterializeAsksThePythonRuntimeForTheResourcesItOwns() throws Exception {
+        TestAgentWithResources agent = new TestAgentWithResources();
+        AgentPlan agentPlan = new AgentPlan(agent);
+        ResourceCache cache = new ResourceCache(agentPlan.getResourceProviders());
+        TestPythonHandle handle = new TestPythonHandle();
+        // No Python resource adapter is wired, so resolving the Python provider here would fail:
+        // the type materializes only because the Python runtime is asked for its own resources.
+        PythonActionExecutor pythonActionExecutor = mock(PythonActionExecutor.class);
+        when(pythonActionExecutor.eagerMaterialize(ResourceType.CHAT_MODEL))
+                .thenReturn(Collections.singletonMap("pythonChatModel", handle));
+        cache.setPythonActionExecutor(pythonActionExecutor);
+
+        List<Resource> materialized = cache.eagerMaterialize(ResourceType.CHAT_MODEL);
+
+        assertThat(materialized).hasSize(2).contains(handle);
+        assertThat(cache.getResource("pythonChatModel", ResourceType.CHAT_MODEL)).isSameAs(handle);
+    }
+
+    @Test
+    public void testEagerMaterializeFailsWhenNoPythonRuntimeWasInitialized() throws Exception {
+        TestAgentWithResources agent = new TestAgentWithResources();
+        AgentPlan agentPlan = new AgentPlan(agent);
+        ResourceCache cache = new ResourceCache(agentPlan.getResourceProviders());
+
+        assertThatThrownBy(() -> cache.eagerMaterialize(ResourceType.CHAT_MODEL))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("declared in Python but no Python runtime was initialized");
+    }
+
     @Test
     public void testGetResourceNotFound() throws Exception {
         Agent agent = new Agent();
@@ -273,5 +344,213 @@ public class ResourceCacheTest {
         // Test that resources are cached (should be the same instance)
         Resource myToolAgain = cache.getResource("myTool", ResourceType.TOOL);
         assertThat(myTool).isSameAs(myToolAgain);
+    }
+
+    /**
+     * A cached resource failing with a non-{@code Exception} {@code Throwable} must not strand the
+     * remaining resources, the cache clear, or the resource context. {@code
+     * ActionExecutionOperator.close()} closes this cache before the Python interpreter precisely
+     * because cached resources may hold Python references, so leaving resources open here while the
+     * interpreter behind them is torn down would break that ordering.
+     */
+    @Test
+    public void closeClosesEveryResourceWhenAnEarlierResourceThrowsError() throws Exception {
+        ResourceCache cache = new ResourceCache(new HashMap<>());
+        OutOfMemoryError failure = new OutOfMemoryError("resource close failed");
+        RecordingResource failing = new RecordingResource(ResourceType.TOOL, failure);
+        RecordingResource surviving = new RecordingResource(ResourceType.CHAT_MODEL, null);
+        cache.put("failing", ResourceType.TOOL, failing);
+        cache.put("surviving", ResourceType.CHAT_MODEL, surviving);
+        // Stands in for the lazily-cached skill manager, so that resourceContext.close() running
+        // is observable rather than merely assumed from its position in the method.
+        SkillManager skillManager = mock(SkillManager.class);
+        setSkillManager(cache.getResourceContext(), skillManager);
+
+        // The Error reaches the caller unchanged rather than wrapped in an Exception, and with
+        // nothing attached to it.
+        assertThatThrownBy(cache::close)
+                .isSameAs(failure)
+                .satisfies(thrown -> assertThat(thrown.getSuppressed()).isEmpty());
+
+        assertThat(failing.closed).isTrue();
+        assertThat(surviving.closed).isTrue();
+        // Neither the cache clear nor the resource context is skipped by the Error.
+        assertThat(cachedResources(cache)).isEmpty();
+        verify(skillManager).close();
+    }
+
+    /** The first failure is rethrown and any later one is attached as suppressed, never dropped. */
+    @Test
+    public void closeReportsFirstResourceFailureWithLaterOnesSuppressed() throws Exception {
+        ResourceCache cache = new ResourceCache(new HashMap<>());
+        RecordingResource first =
+                new RecordingResource(ResourceType.TOOL, new IllegalStateException("first"));
+        RecordingResource second =
+                new RecordingResource(ResourceType.TOOL, new IllegalStateException("second"));
+        cache.put("first", ResourceType.TOOL, first);
+        cache.put("second", ResourceType.TOOL, second);
+
+        Throwable thrown = catchThrowable(cache::close);
+
+        // Iteration order over the cache is unspecified, so pin the aggregation rather than which
+        // of the two lands first: one is thrown and the other is suppressed on it.
+        assertThat(thrown).isInstanceOf(IllegalStateException.class);
+        assertThat(thrown.getSuppressed()).hasSize(1);
+        assertThat(new String[] {thrown.getMessage(), thrown.getSuppressed()[0].getMessage()})
+                .containsExactlyInAnyOrder("first", "second");
+        assertThat(first.closed).isTrue();
+        assertThat(second.closed).isTrue();
+    }
+
+    /**
+     * The close-all guarantee has to reach the nested skill repositories, not stop at {@code
+     * ResourceContextImpl}. Exercised through the real production path — {@code
+     * ResourceCache.close()} → {@code ResourceContextImpl.close()} → {@code SkillManager.close()} →
+     * the repos — because {@code ResourceContextImpl} clears its manager reference in a {@code
+     * finally}, so a repo skipped here can never be retried and leaks its temp directory.
+     */
+    @Test
+    public void closeClosesEverySkillRepositoryWhenAnEarlierRepoThrowsError() throws Exception {
+        // Both repos fail, so the assertions do not depend on the de-dup set's iteration order:
+        // a handler narrowed to Exception anywhere along the chain stops at whichever runs first
+        // and leaves the other unclosed, which fails here either way round.
+        Error firstBoom = new Error("repo close failed");
+        Error secondBoom = new Error("other repo close failed");
+        RecordingRepo failing = new RecordingRepo("alpha", firstBoom);
+        RecordingRepo surviving = new RecordingRepo("beta", secondBoom);
+        AtomicInteger seq = new AtomicInteger();
+        List<RecordingRepo> ordered = List.of(failing, surviving);
+        SkillSourceRegistry.register(
+                "test-resource-cache-close-error",
+                (params, cl) -> ordered.get(seq.getAndIncrement()));
+        Skills skills =
+                new Skills(
+                        List.of(
+                                new SkillSourceSpec("test-resource-cache-close-error", Map.of()),
+                                new SkillSourceSpec("test-resource-cache-close-error", Map.of())));
+
+        ResourceCache cache = new ResourceCache(new HashMap<>());
+        cache.put(Skills.SKILLS_CONFIG, ResourceType.SKILLS, skills);
+        // Force the lazily-cached SkillManager to exist, so close() has repos to release.
+        cache.getResourceContext().getSkillDirs(List.of("alpha"));
+
+        // The Error reaches the caller unwrapped, through both intervening close() methods.
+        Throwable thrown = catchThrowable(cache::close);
+
+        assertThat(thrown).isInstanceOf(Error.class);
+        assertThat(failing.closed).isTrue();
+        assertThat(surviving.closed).isTrue();
+        assertThat(thrown.getSuppressed()).hasSize(1);
+        assertThat(List.of(thrown, thrown.getSuppressed()[0]))
+                .containsExactlyInAnyOrder(firstBoom, secondBoom);
+    }
+
+    /** A skill repository that records its close and can be made to fail it. */
+    private static final class RecordingRepo implements SkillRepository {
+        private final AgentSkill skill;
+        private final Throwable failure;
+        private boolean closed = false;
+
+        private RecordingRepo(String skillName, Throwable failure) {
+            this.skill = new AgentSkill(skillName, "fake", "body", null, null, null);
+            this.failure = failure;
+        }
+
+        @Override
+        public AgentSkill getSkill(String name) {
+            return name.equals(skill.getName()) ? skill : null;
+        }
+
+        @Override
+        public List<AgentSkill> getSkills() {
+            return List.of(skill);
+        }
+
+        @Override
+        public Map<String, String> getResources(String name) {
+            return Map.of();
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            if (failure instanceof Error) {
+                throw (Error) failure;
+            }
+            if (failure instanceof RuntimeException) {
+                throw (RuntimeException) failure;
+            }
+        }
+    }
+
+    private static void setSkillManager(ResourceContextImpl context, SkillManager skillManager)
+            throws Exception {
+        Field field = ResourceContextImpl.class.getDeclaredField("skillManager");
+        field.setAccessible(true);
+        field.set(context, skillManager);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<ResourceType, Map<String, Resource>> cachedResources(ResourceCache cache)
+            throws Exception {
+        Field field = ResourceCache.class.getDeclaredField("cache");
+        field.setAccessible(true);
+        return (Map<ResourceType, Map<String, Resource>>) field.get(cache);
+    }
+
+    /** Records whether {@code close()} ran, and optionally fails it. */
+    private static final class RecordingResource extends Resource {
+        private final ResourceType type;
+        private final Throwable failure;
+        private boolean closed = false;
+
+        private RecordingResource(ResourceType type, Throwable failure) {
+            this.type = type;
+            this.failure = failure;
+        }
+
+        @Override
+        public ResourceType getResourceType() {
+            return type;
+        }
+
+        @Override
+        public void close() throws Exception {
+            closed = true;
+            if (failure instanceof Error) {
+                throw (Error) failure;
+            }
+            if (failure instanceof Exception) {
+                throw (Exception) failure;
+            }
+        }
+    }
+
+    /** Test Java sub-agent setup, registered as an AGENT resource. */
+    public static class TestAgentSetup extends BaseSubagentSetup {
+        @Override
+        public SubagentFuture submit(
+                RunnerContext ctx, Object prompt, String sessionId, String callId) {
+            return null;
+        }
+    }
+
+    @Test
+    public void testMaterializingAnAgentInjectsTheResourceNameAsSubagentName() throws Exception {
+        Map<ResourceType, Map<String, ResourceProvider>> providers = new HashMap<>();
+        Map<String, ResourceProvider> agentProviders = new HashMap<>();
+        agentProviders.put(
+                "reviewer",
+                JavaSerializableResourceProvider.createResourceProvider(
+                        "reviewer", ResourceType.AGENT, new TestAgentSetup()));
+        providers.put(ResourceType.AGENT, agentProviders);
+
+        ResourceCache cache = new ResourceCache(providers);
+        List<Resource> materialized = cache.eagerMaterialize(ResourceType.AGENT);
+
+        assertThat(materialized).hasSize(1);
+        assertThat(materialized.get(0)).isInstanceOf(TestAgentSetup.class);
+        // The framework owns the identity: the resource name becomes the sub-agent name.
+        assertThat(((TestAgentSetup) materialized.get(0)).getSubagentName()).isEqualTo("reviewer");
     }
 }

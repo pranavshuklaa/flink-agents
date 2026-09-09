@@ -19,6 +19,7 @@ import itertools
 import json
 import logging
 import os
+import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ import cloudpickle
 from typing_extensions import override
 
 from flink_agents.api.configuration import ReadableConfiguration
+from flink_agents.api.core_options import AgentExecutionOptions
 from flink_agents.api.events.event import Event
 from flink_agents.api.memory.long_term_memory import (
     BaseLongTermMemory,
@@ -39,6 +41,8 @@ from flink_agents.api.metric_group import MetricGroup
 from flink_agents.api.resource import Resource, ResourceType
 from flink_agents.api.runner_context import (
     AsyncExecutionResult,
+    DurableCall,
+    Outcome,
     RunnerContext,
 )
 from flink_agents.api.trace import ExecutionReporter
@@ -46,6 +50,8 @@ from flink_agents.runtime.durable_execution import (
     _compute_args_digest,
     _compute_function_id,
     _validate_reconciler_callable,
+    durable_identity_for_call,
+    with_durable_id,
 )
 from flink_agents.runtime.flink_memory_object import FlinkMemoryObject
 from flink_agents.runtime.flink_metric_group import FlinkMetricGroup
@@ -55,7 +61,12 @@ from flink_agents.runtime.memory.internal_base_long_term_memory import (
 from flink_agents.runtime.memory.mem0.mem0_long_term_memory import (
     Mem0LongTermMemory,
 )
-from flink_agents.runtime.resource_cache import ResourceCache
+from flink_agents.runtime.resource_cache import (
+    ResourceCache,
+    _failure_of,
+    _first_or_logged,
+)
+from flink_agents.runtime.task_lifecycle_listener import TaskLifecycleListener
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +102,14 @@ class _ReconcilerExecutionPlan:
     callable: Callable[[], Any] | None = None
     needs_clear: bool = False
     needs_append_pending: bool = False
+
+
+@dataclass(frozen=True)
+class _BatchExecutionPlan:
+    outcomes: list[Outcome]
+    suppliers: list[tuple[int, Callable[[], Any]]]
+    needs_reservation: bool = False
+    execution_start: int = -1
 
 
 class _DurableExecutionResult:
@@ -198,6 +217,45 @@ class _DurableAsyncExecutionResult(AsyncExecutionResult):
             return result
 
 
+class _PendingFinalizeAsyncExecutionResult(AsyncExecutionResult):
+    """An AsyncExecutionResult that finalizes a matching pending slot on await."""
+
+    def __init__(
+        self,
+        ctx: "FlinkRunnerContext",
+        executor: Any,
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
+        super().__init__(executor, func, args, kwargs)
+        self._ctx = ctx
+
+    def __await__(self) -> Any:
+        future = self._executor.submit(self._func, *self._args, **self._kwargs)
+        while not future.done():
+            yield
+
+        exception = None
+        result = None
+        try:
+            result = future.result()
+        except BaseException as e:
+            exception = e
+
+        self._ctx._finalize_current_call(
+            self._func,
+            self._args,
+            self._kwargs,
+            result,
+            exception,
+        )
+
+        if exception is not None:
+            raise exception
+        return result
+
+
 class _ReconcilerDurableAsyncExecutionResult(AsyncExecutionResult):
     """An AsyncExecutionResult that resolves reconciler state on await."""
 
@@ -261,6 +319,140 @@ class _ReconcilerDurableAsyncExecutionResult(AsyncExecutionResult):
         return result
 
 
+class _DurableBatchAsyncExecutionResult(AsyncExecutionResult):
+    def __init__(self, ctx: "FlinkRunnerContext", calls: list[DurableCall]) -> None:
+        self._ctx = ctx
+        self._calls = calls
+
+    def __await__(self) -> Any:
+        plan = self._ctx._prepare_batch_execution(self._calls)
+        parallelism = self._ctx.config.get(AgentExecutionOptions.TOOL_CALL_PARALLELISM)
+        timeout_ms = self._ctx.config.get(
+            AgentExecutionOptions.TOOL_CALL_BATCH_TIMEOUT_MS
+        )
+        deadline = time.monotonic() + timeout_ms / 1000 if timeout_ms > 0 else None
+        suppliers = [supplier for _, supplier in plan.suppliers]
+        batch_futures: list[Any | None] = [None] * len(suppliers)
+        started: list[bool] = [False] * len(suppliers)
+        try:
+            executed = yield from _execute_sliding_window_batch(
+                self._ctx.executor,
+                suppliers,
+                parallelism,
+                deadline,
+                timeout_ms,
+                batch_futures,
+                started,
+            )
+        except _BatchTimeoutError as exception:
+            executed = _collect_sliding_window_outcomes_on_timeout(
+                batch_futures, exception
+            )
+        return self._ctx._finalize_batch_execution(self._calls, plan, started, executed)
+
+
+class _BatchTimeoutError(TimeoutError):
+    """Raised when a durable batch exceeds its deadline."""
+
+
+def _mark_started_on_run(
+    supplier: Callable[[], Any], started: list[bool], index: int
+) -> Callable[[], Any]:
+    """Wrap a supplier so ``started[index]`` flips only when the worker truly runs.
+
+    A task queued in a saturated pool but cancelled before it executes keeps
+    ``started[index] == False``, so it is treated as never-run and stays
+    re-executable on recovery instead of being recorded as a timeout failure.
+    """
+
+    def _run() -> Any:
+        started[index] = True
+        return supplier()
+
+    return _run
+
+
+def _execute_sliding_window_batch(
+    executor: ThreadPoolExecutor,
+    suppliers: list[Any],
+    parallelism: int,
+    deadline: float | None,
+    timeout_ms: int,
+    futures: list[Any | None],
+    started: list[bool],
+) -> Any:
+    batch_size = len(suppliers)
+    if batch_size == 0:
+        return []
+
+    parallelism_limit = min(max(parallelism, 1), batch_size)
+    next_to_submit = 0
+    completed = 0
+    counted = [False] * batch_size
+
+    def in_flight() -> int:
+        return sum(
+            1
+            for i in range(next_to_submit)
+            if futures[i] is not None and not futures[i].done()
+        )
+
+    while completed < batch_size:
+        if deadline is not None and time.monotonic() >= deadline:
+            timeout_message = (
+                f"Async durable batch execution timed out after {timeout_ms} ms"
+            )
+            raise _BatchTimeoutError(timeout_message)
+
+        while next_to_submit < batch_size and in_flight() < parallelism_limit:
+            index = next_to_submit
+            futures[index] = executor.submit(
+                _mark_started_on_run(suppliers[index], started, index)
+            )
+            next_to_submit += 1
+
+        for i in range(next_to_submit):
+            if not counted[i] and futures[i].done():
+                counted[i] = True
+                completed += 1
+
+        if completed < batch_size:
+            yield
+
+    return _collect_outcomes(futures)
+
+
+def _collect_sliding_window_outcomes_on_timeout(
+    futures: list[Any | None],
+    timeout_exception: BaseException,
+) -> list[Outcome]:
+    outcomes = []
+    for future in futures:
+        if future is None:
+            outcomes.append(Outcome.failure(timeout_exception))
+            continue
+        if not future.done():
+            future.cancel()
+        if future.done() and not future.cancelled():
+            try:
+                outcomes.append(Outcome.success(future.result()))
+            except Exception as e:
+                outcomes.append(Outcome.failure(e))
+        else:
+            outcomes.append(Outcome.failure(timeout_exception))
+    return outcomes
+
+
+def _collect_outcomes(futures: list[Any]) -> list[Outcome]:
+    outcomes = []
+    for future in futures:
+        try:
+            outcomes.append(Outcome.success(future.result()))
+        except Exception as e:  # noqa: PERF203
+            outcomes.append(Outcome.failure(e))
+    return outcomes
+
+
 class FlinkRunnerContext(RunnerContext, ExecutionReporter):
     """Providing context for agent execution in Flink Environment.
 
@@ -293,7 +485,12 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
             self.__agent_plan.resource_providers, self.__agent_plan.config
         )
         self.__resource_cache.set_java_resource_adapter(j_resource_adapter)
+        self.__config = self.__agent_plan.config
         self.executor = executor
+        # Task lifecycle listeners the operator's callbacks fan out to,
+        # registered via add_task_lifecycle_listener() (aligned with the Java
+        # operator's taskLifecycleListeners).
+        self.__task_lifecycle_listeners: list = []
 
     def set_long_term_memory(self, ltm: InternalBaseLongTermMemory) -> None:
         """Set long term memory instance to this context.
@@ -338,6 +535,75 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         # Bind metric group to the resource
         resource.set_metric_group(metric_group or self.action_metric_group)
         return resource
+
+    def eager_materialize(self, resource_type: str) -> Dict[str, Resource]:
+        """Materialize every Python-owned resource of ``resource_type``.
+
+        The Python-side counterpart of the Java ``ResourceCache.eagerMaterialize``:
+        resources declared by Python providers are built, cached and closed here,
+        so the Java side asks for them instead of building its own. Returns them
+        keyed by resource name.
+        """
+        from flink_agents.plan.resource_provider import is_python_owned
+
+        type_ = ResourceType(resource_type)
+        materialized = {}
+        providers = self.__agent_plan.resource_providers.get(type_, {})
+        for name, provider in providers.items():
+            if not is_python_owned(provider):
+                # Java-owned resources are materialized by the Java resource cache.
+                continue
+            materialized[name] = self.__resource_cache.get_resource(name, type_)
+        return materialized
+
+    def add_task_lifecycle_listener(self, listener: Any) -> None:
+        """Register a task lifecycle listener the operator's callbacks fan out to."""
+        self.__task_lifecycle_listeners.append(listener)
+
+    def notify_record_start(self, key: Any) -> None:
+        """Fan out the operator's onRecordStart to the task lifecycle listeners."""
+        for listener in self.__task_lifecycle_listeners:
+            listener.on_record_start(key)
+
+    def notify_action_prepared(self, task: Any) -> None:
+        """Fan out the operator's onActionPrepared to the task lifecycle listeners."""
+        for listener in self.__task_lifecycle_listeners:
+            listener.on_action_prepared(task)
+
+    def notify_action_started(self, task: Any) -> None:
+        """Fan out the operator's onActionStarted to the task lifecycle listeners."""
+        for listener in self.__task_lifecycle_listeners:
+            listener.on_action_started(task)
+
+    def notify_action_transferred(self, from_task: Any, to_task: Any) -> None:
+        """Fan out the operator's onActionTransferred to the listeners."""
+        for listener in self.__task_lifecycle_listeners:
+            listener.on_action_transferred(from_task, to_task)
+
+    def notify_action_finishing(self, task: Any) -> None:
+        """Fan out the operator's onActionFinishing to the task lifecycle listeners."""
+        for listener in self.__task_lifecycle_listeners:
+            listener.on_action_finishing(task)
+
+    def notify_action_finished(self, task: Any) -> None:
+        """Fan out the operator's onActionFinished to the listeners."""
+        for listener in self.__task_lifecycle_listeners:
+            listener.on_action_finished(task)
+
+    def notify_action_reused(self, task: Any) -> None:
+        """Fan out the operator's onActionReused to the task lifecycle listeners."""
+        for listener in self.__task_lifecycle_listeners:
+            listener.on_action_reused(task)
+
+    def notify_action_failed(self, task: Any, error: Any) -> None:
+        """Fan out the operator's onActionFailed to the task lifecycle listeners."""
+        for listener in self.__task_lifecycle_listeners:
+            listener.on_action_failed(task, error)
+
+    def notify_record_finished(self, key: Any) -> None:
+        """Fan out the operator's onRecordFinished to the task lifecycle listeners."""
+        for listener in self.__task_lifecycle_listeners:
+            listener.on_record_finished(key)
 
     @property
     @override
@@ -472,7 +738,10 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         return json.dumps(dict(entity_metadata or {}))
 
     def _try_get_cached_result(
-        self, func: Callable, args: tuple, kwargs: dict
+        self,
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
     ) -> tuple[bool, Any]:
         """Try to get a cached result from a previous execution.
 
@@ -482,8 +751,7 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
             A tuple of (is_hit, result_or_exception). If is_hit is True,
             the second element is the cached result or an exception to re-raise.
         """
-        function_id = _compute_function_id(func)
-        args_digest = _compute_args_digest(args, kwargs)
+        function_id, args_digest = durable_identity_for_call(func, args, kwargs)
 
         cached_exception: BaseException | None = None
         try:
@@ -536,8 +804,7 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         exception : BaseException | None
             The exception raised by the function (None if successful).
         """
-        function_id = _compute_function_id(func)
-        args_digest = _compute_args_digest(args, kwargs)
+        function_id, args_digest = durable_identity_for_call(func, args, kwargs)
 
         try:
             result_payload = None if exception else cloudpickle.dumps(result)
@@ -559,6 +826,24 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         result_payload = None if exception else cloudpickle.dumps(result)
         exception_payload = cloudpickle.dumps(exception) if exception else None
         return result_payload, exception_payload
+
+    def _read_call_result_at(self, index: int) -> _PersistedCallResult | None:
+        current = self._j_runner_context.getCallResultFieldsAt(index)
+        if current is None:
+            return None
+
+        function_id, args_digest, status, result_payload, exception_payload = current
+        return _PersistedCallResult(
+            function_id=function_id,
+            args_digest=args_digest,
+            status=status,
+            result_payload=bytes(result_payload)
+            if result_payload is not None
+            else None,
+            exception_payload=(
+                bytes(exception_payload) if exception_payload is not None else None
+            ),
+        )
 
     def _peek_current_call_result(self) -> _PersistedCallResult | None:
         current = self._j_runner_context.getCurrentCallResultFields()
@@ -592,8 +877,7 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         result: Any,
         exception: BaseException | None,
     ) -> None:
-        function_id = _compute_function_id(func)
-        args_digest = _compute_args_digest(args, kwargs)
+        function_id, args_digest = durable_identity_for_call(func, args, kwargs)
         result_payload, exception_payload = self._serialize_call_payloads(
             result,
             exception,
@@ -622,8 +906,7 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         reconciler: Callable[[], Any],
         kwargs: dict,
     ) -> _ReconcilerExecutionPlan:
-        function_id = _compute_function_id(func)
-        args_digest = _compute_args_digest(args, kwargs)
+        function_id, args_digest = durable_identity_for_call(func, args, kwargs)
         current = self._peek_current_call_result()
         durable_call = partial(func, *args, **kwargs)
 
@@ -662,6 +945,21 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         if plan.needs_append_pending:
             self._append_pending_call(func, args, kwargs)
 
+    def _matches_current_pending_call(
+        self,
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
+    ) -> bool:
+        function_id, args_digest = durable_identity_for_call(func, args, kwargs)
+        current = self._peek_current_call_result()
+        return (
+            current is not None
+            and current.function_id == function_id
+            and current.args_digest == args_digest
+            and current.status == "PENDING"
+        )
+
     def _execute_current_pending_call(
         self,
         execution_callable: Callable[[], Any],
@@ -682,12 +980,66 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
             raise exception
         return result
 
+    def _execute_and_record_completion_only(
+        self,
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        exception = None
+        result = None
+        try:
+            result = func(*args, **kwargs)
+        except BaseException as e:
+            exception = e
+
+        self._record_call_completion(func, args, kwargs, result, exception)
+
+        if exception is not None:
+            raise exception
+        return result
+
+    def _run_completion_only_durable_execute(
+        self,
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        if self._matches_current_pending_call(func, args, kwargs):
+            return self._execute_current_pending_call(
+                partial(func, *args, **kwargs),
+                func,
+                args,
+                kwargs,
+            )
+
+        is_hit, cached_result = self._try_get_cached_result(func, args, kwargs)
+        if is_hit:
+            return cached_result
+
+        return self._execute_and_record_completion_only(func, args, kwargs)
+
     def _wrap_completion_only_func(
         self,
         func: Callable,
         args: tuple,
         kwargs: dict,
     ) -> Callable[..., Any]:
+        def record_call_completion(
+            call_func: Callable,
+            call_args: tuple,
+            call_kwargs: dict,
+            result: Any,
+            exception: BaseException | None,
+        ) -> None:
+            self._record_call_completion(
+                call_func,
+                call_args,
+                call_kwargs,
+                result,
+                exception,
+            )
+
         def wrapped_func(*a: Any, **kw: Any) -> Any:
             exception = None
             result = None
@@ -698,13 +1050,137 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
 
             if exception:
                 raise _DurableExecutionException(
-                    func, args, kwargs, result, exception, self._record_call_completion
+                    func, args, kwargs, result, exception, record_call_completion
                 )
             return _DurableExecutionResult(
-                func, args, kwargs, result, self._record_call_completion
+                func, args, kwargs, result, record_call_completion
             )
 
         return wrapped_func
+
+    def _durable_identity(self, call: DurableCall) -> tuple[str, str]:
+        return durable_identity_for_call(call.func, call.args, call.kwargs)
+
+    def _call_matches(self, current: _PersistedCallResult, call: DurableCall) -> bool:
+        function_id, args_digest = self._durable_identity(call)
+        return current.function_id == function_id and current.args_digest == args_digest
+
+    def _read_terminal_outcome(self, current: _PersistedCallResult) -> Outcome:
+        try:
+            if current.exception_payload is not None:
+                return Outcome.failure(cloudpickle.loads(current.exception_payload))
+            if current.result_payload is None:
+                return Outcome.success(None)
+            return Outcome.success(cloudpickle.loads(current.result_payload))
+        except Exception as e:
+            return Outcome.failure(e)
+
+    def _callable_for_durable_call(self, call: DurableCall) -> Callable[[], Any]:
+        kwargs = call.kwargs or {}
+        return partial(call.func, *call.args, **kwargs)
+
+    def _prepare_batch_execution(self, calls: list[DurableCall]) -> _BatchExecutionPlan:
+        base = self._j_runner_context.getCurrentCallIndex()
+        outcomes: list[Outcome | None] = []
+        suppliers: list[tuple[int, Callable[[], Any]]] = []
+        needs_reservation = False
+        execution_start = -1
+
+        for index, call in enumerate(calls):
+            function_id, args_digest = self._durable_identity(call)
+            current = self._read_call_result_at(base + index)
+            if current is None:
+                needs_reservation = True
+                if execution_start < 0:
+                    execution_start = index
+                outcomes.append(None)
+                suppliers.append((index, self._callable_for_durable_call(call)))
+                continue
+
+            if not self._call_matches(current, call):
+                self._j_runner_context.clearCallResultsFromAndPersist(base + index)
+                needs_reservation = True
+                execution_start = index
+                outcomes.append(None)
+                suppliers.append((index, self._callable_for_durable_call(call)))
+                for remaining_index in range(index + 1, len(calls)):
+                    outcomes.append(None)
+                    suppliers.append(
+                        (
+                            remaining_index,
+                            self._callable_for_durable_call(calls[remaining_index]),
+                        )
+                    )
+                break
+
+            if current.status == "PENDING":
+                outcomes.append(None)
+                suppliers.append(
+                    (
+                        index,
+                        call.reconciler or self._callable_for_durable_call(call),
+                    )
+                )
+            else:
+                outcomes.append(self._read_terminal_outcome(current))
+
+        if needs_reservation:
+            function_ids = []
+            args_digests = []
+            for call in calls[execution_start:]:
+                function_id, args_digest = self._durable_identity(call)
+                function_ids.append(function_id)
+                args_digests.append(args_digest)
+            self._j_runner_context.reservePendingBatch(function_ids, args_digests)
+
+        return _BatchExecutionPlan(
+            outcomes=outcomes,
+            suppliers=suppliers,
+            needs_reservation=needs_reservation,
+            execution_start=execution_start,
+        )
+
+    def _finalize_batch_execution(
+        self,
+        calls: list[DurableCall],
+        plan: _BatchExecutionPlan,
+        started: list[bool],
+        executed: list[Outcome],
+    ) -> list[Outcome]:
+        base = self._j_runner_context.getCurrentCallIndex()
+        outcomes = list(plan.outcomes)
+        for i, ((call_index, _), outcome) in enumerate(
+            zip(plan.suppliers, executed, strict=True)
+        ):
+            call = calls[call_index]
+            function_id, args_digest = self._durable_identity(call)
+            if not started[i]:
+                outcomes[call_index] = outcome
+                continue
+            try:
+                result_payload, exception_payload = self._serialize_call_payloads(
+                    outcome.value,
+                    outcome.error,
+                )
+                self._j_runner_context.finalizeCallAt(
+                    base + call_index,
+                    function_id,
+                    args_digest,
+                    result_payload,
+                    exception_payload,
+                )
+            except Exception as e:
+                outcome = Outcome.failure(e)
+            outcomes[call_index] = outcome
+        self._j_runner_context.advanceCallIndexBy(len(calls))
+        return outcomes
+
+    @override
+    def durable_execute_all_async(
+        self,
+        callables: list[DurableCall],
+    ) -> AsyncExecutionResult:
+        return _DurableBatchAsyncExecutionResult(self, callables)
 
     @override
     def durable_execute(
@@ -712,6 +1188,7 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         func: Callable[[Any], Any],
         *args: Any,
         reconciler: Callable[[], Any] | None = None,
+        durable_id: str | None = None,
         **kwargs: Any,
     ) -> Any:
         """Synchronously execute the provided function with durable execution support.
@@ -725,6 +1202,8 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         the operator until completion.
         """
         validated_reconciler = _validate_reconciler_callable(reconciler)
+        if durable_id is not None:
+            func = with_durable_id(func, durable_id)
 
         if validated_reconciler is not None:
             plan = self._plan_reconciler_execution(
@@ -744,25 +1223,7 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
                 kwargs,
             )
 
-        # Try to get cached result for recovery
-        is_hit, cached_result = self._try_get_cached_result(func, args, kwargs)
-        if is_hit:
-            return cached_result
-
-        # Execute the function
-        exception = None
-        result = None
-        try:
-            result = func(*args, **kwargs)
-        except BaseException as e:
-            exception = e
-
-        # Record the completion
-        self._record_call_completion(func, args, kwargs, result, exception)
-
-        if exception:
-            raise exception
-        return result
+        return self._run_completion_only_durable_execute(func, args, kwargs)
 
     @override
     def durable_execute_async(
@@ -770,6 +1231,7 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         func: Callable[[Any], Any],
         *args: Any,
         reconciler: Callable[[], Any] | None = None,
+        durable_id: str | None = None,
         **kwargs: Any,
     ) -> AsyncExecutionResult:
         """Asynchronously execute the provided function with durable execution support.
@@ -784,6 +1246,8 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         recorded and cannot be recovered.
         """
         validated_reconciler = _validate_reconciler_callable(reconciler)
+        if durable_id is not None:
+            func = with_durable_id(func, durable_id)
 
         if validated_reconciler is not None:
             return _ReconcilerDurableAsyncExecutionResult(
@@ -795,10 +1259,17 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
                 kwargs,
             )
 
-        # Try to get cached result for recovery
+        if self._matches_current_pending_call(func, args, kwargs):
+            return _PendingFinalizeAsyncExecutionResult(
+                self,
+                self.executor,
+                func,
+                args,
+                kwargs,
+            )
+
         is_hit, cached_result = self._try_get_cached_result(func, args, kwargs)
         if is_hit:
-            # Return a pre-completed AsyncExecutionResult
             return _CachedAsyncExecutionResult(cached_result)
 
         return _DurableAsyncExecutionResult(
@@ -818,18 +1289,27 @@ class FlinkRunnerContext(RunnerContext, ExecutionReporter):
         ReadableConfiguration
             The configuration for flink agents.
         """
+        if hasattr(self, "_FlinkRunnerContext__config"):
+            return self.__config
         return self.__agent_plan.config
 
     @override
     def close(self) -> None:
-        if self.long_term_memory is not None:
-            self.long_term_memory.close()
+        ltm = self.__ltm
+        self.__ltm = None
 
-        if self.__resource_cache is not None:
-            try:
-                self.__resource_cache.close()
-            finally:
-                self.__resource_cache = None
+        first_failure = _failure_of(ltm.close) if ltm is not None else None
+
+        resource_cache = self.__resource_cache
+        self.__resource_cache = None
+        first_failure = _first_or_logged(
+            _failure_of(resource_cache.close) if resource_cache is not None else None,
+            first_failure,
+            "runner context resource cache",
+        )
+
+        if first_failure is not None:
+            raise first_failure
 
 
 def create_flink_runner_context(
@@ -872,7 +1352,21 @@ def _init_long_term_memory(
         chat_model_name=chat_model_name,
         embedding_model_name=embedding_model_name,
         vector_store_name=vector_store_name,
+        mailbox_thread_checker=lambda: ctx._j_runner_context.checkMailboxThread(),
     )
+
+
+def flink_runner_context_switch_action_context(
+    ctx: FlinkRunnerContext,
+    key: int,
+) -> None:
+    """Switch the context of the flink runner context.
+
+    The ctx is reused across keyed partitions, the context related to
+    specific key should be switched when process new action.
+    """
+    if ctx.long_term_memory is not None:
+        ctx.long_term_memory.switch_context(str(key))
 
 
 def close_flink_runner_context(
@@ -880,6 +1374,72 @@ def close_flink_runner_context(
 ) -> None:
     """Clean up the resources kept by the flink runner context."""
     ctx.close()
+
+
+def eager_materialize(
+    ctx: FlinkRunnerContext, resource_type: str
+) -> Dict[str, Resource]:
+    """Java entry: materialize the Python-owned resources of ``resource_type``."""
+    return ctx.eager_materialize(resource_type)
+
+
+def add_task_lifecycle_listener(ctx: FlinkRunnerContext, listener: Any) -> bool:
+    """Java entry: register a Python object as a task lifecycle listener.
+
+    Returns whether it observes the lifecycle, so the Java side knows whether the
+    Python runtime has anything to be notified about.
+    """
+    if not isinstance(listener, TaskLifecycleListener):
+        return False
+    ctx.add_task_lifecycle_listener(listener)
+    return True
+
+
+def notify_record_start(ctx: FlinkRunnerContext, key: Any) -> None:
+    """Java entry: forward onRecordStart to the Python task lifecycle listeners."""
+    ctx.notify_record_start(key)
+
+
+def notify_action_prepared(ctx: FlinkRunnerContext, task: Any) -> None:
+    """Java entry: forward onActionPrepared to the Python task lifecycle listeners."""
+    ctx.notify_action_prepared(task)
+
+
+def notify_action_started(ctx: FlinkRunnerContext, task: Any) -> None:
+    """Java entry: forward onActionStarted to the Python task lifecycle listeners."""
+    ctx.notify_action_started(task)
+
+
+def notify_action_transferred(
+    ctx: FlinkRunnerContext, from_task: Any, to_task: Any
+) -> None:
+    """Java entry: forward onActionTransferred to the Python listeners."""
+    ctx.notify_action_transferred(from_task, to_task)
+
+
+def notify_action_finishing(ctx: FlinkRunnerContext, task: Any) -> None:
+    """Java entry: forward onActionFinishing to the Python task lifecycle listeners."""
+    ctx.notify_action_finishing(task)
+
+
+def notify_action_finished(ctx: FlinkRunnerContext, task: Any) -> None:
+    """Java entry: forward onActionFinished to the Python listeners."""
+    ctx.notify_action_finished(task)
+
+
+def notify_action_reused(ctx: FlinkRunnerContext, task: Any) -> None:
+    """Java entry: forward onActionReused to the Python task lifecycle listeners."""
+    ctx.notify_action_reused(task)
+
+
+def notify_action_failed(ctx: FlinkRunnerContext, task: Any, error: Any) -> None:
+    """Java entry: forward onActionFailed to the Python task lifecycle listeners."""
+    ctx.notify_action_failed(task, error)
+
+
+def notify_record_finished(ctx: FlinkRunnerContext, key: Any) -> None:
+    """Java entry: forward onRecordFinished to the Python task lifecycle listeners."""
+    ctx.notify_record_finished(key)
 
 
 _ASYNC_POOL_ID = itertools.count(1)

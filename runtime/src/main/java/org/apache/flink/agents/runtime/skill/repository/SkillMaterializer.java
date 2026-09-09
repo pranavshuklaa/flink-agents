@@ -438,45 +438,34 @@ public final class SkillMaterializer {
     public static Path downloadToTempFile(String url, int timeoutMs, boolean allowInsecureHttp)
             throws IOException {
         URL u;
-
         try {
             u = new URL(url);
         } catch (MalformedURLException ignored) {
             throw new IOException("Invalid skill URL: " + SkillUrlUtils.redact(url));
         }
-
         String initialProtocol = requireValidDownloadUrl(u, allowInsecureHttp);
         boolean followRedirects = HttpURLConnection.getFollowRedirects();
-
         Path tmpZip = Files.createTempFile(TEMP_DIR_PREFIX, ".zip");
         HttpURLConnection conn = null;
-
         try {
             URL effectiveUrl = u;
             int redirects = 0;
-
             while (true) {
                 conn = (HttpURLConnection) effectiveUrl.openConnection();
                 conn.setConnectTimeout(timeoutMs);
                 conn.setReadTimeout(timeoutMs);
                 conn.setRequestMethod("GET");
-
                 // Validate each redirect ourselves before opening its target. This also preserves
                 // the JVM-wide switch that lets deployments disable redirects.
                 conn.setInstanceFollowRedirects(false);
-
                 int responseCode = conn.getResponseCode();
-
                 if (isRedirectStatus(responseCode)) {
                     String location = conn.getHeaderField("Location");
-
                     if (location == null) {
                         throw new IOException(
                                 "Skill URL returned an invalid redirect to: <redacted>");
                     }
-
                     URL redirectUrl;
-
                     try {
                         redirectUrl = new URL(effectiveUrl, location);
                     } catch (MalformedURLException ignored) {
@@ -484,32 +473,26 @@ public final class SkillMaterializer {
                                 "Skill URL returned an invalid redirect to: "
                                         + SkillUrlUtils.redact(location));
                     }
-
                     if (!followRedirects) {
                         throw new IOException(
                                 "Skill URL returned an unsupported redirect to: "
                                         + SkillUrlUtils.redact(redirectUrl.toExternalForm()));
                     }
-
                     String redirectProtocol = requireValidDownloadUrl(redirectUrl, true);
-
                     if (!redirectProtocol.equals(initialProtocol)) {
                         throw new IOException(
                                 "Skill URL returned an unsupported redirect to: "
                                         + SkillUrlUtils.redact(redirectUrl.toExternalForm()));
                     }
-
                     if (redirects >= MAX_REDIRECTS) {
                         throw new IOException("Skill URL returned too many redirects");
                     }
-
                     redirects++;
                     conn.disconnect();
                     conn = null;
                     effectiveUrl = redirectUrl;
                     continue;
                 }
-
                 if (responseCode < 200 || responseCode >= 300) {
                     throw new IOException(
                             "Skill URL returned HTTP "
